@@ -179,3 +179,124 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
         hash = hash * 33 + c;
     return hash % num_partitions;
 }
+
+
+
+
+
+// map threads and scheduling
+typedef struct map_file {
+    char *name;
+    off_t size;
+} map_file_t;
+
+typedef struct file_queue {
+    map_file_t *files;
+    size_t count;
+    size_t next;
+    pthread_mutex_t lock;
+} file_queue_t;
+
+static int compare_map_files(const void *left, const void *right) {
+    const map_file_t *a = (const map_file_t *)left;
+    const map_file_t *b = (const map_file_t *)right;
+
+    if (a->size < b->size)
+        return 1;
+    if (a->size > b->size)
+        return -1;
+    return strcmp(a->name, b->name);
+}
+
+static void *mapper_worker(void *arg) {
+    file_queue_t *queue = (file_queue_t *)arg;
+
+    for (;;) {
+        char *file_name;
+
+        pthread_mutex_lock(&queue->lock);
+        if (queue->next >= queue->count) {
+            pthread_mutex_unlock(&queue->lock);
+            break;
+        }
+
+        file_name = queue->files[queue->next].name;
+        queue->next++;
+        pthread_mutex_unlock(&queue->lock);
+
+        map_fn(file_name);
+    }
+
+    return NULL;
+}
+
+static void map_phase(int argc, char *argv[], int num_mappers) 
+{
+    file_queue_t queue;
+    pthread_t *threads;
+    int files_count;
+    int threads_created = 0;
+    int i;
+if (argc <= 1 || map_fn == NULL) return;
+files_count = argc - 1;
+queue.files = malloc((size_t)files_count * sizeof(*queue.files));
+if (queue.files == NULL) 
+{
+  // size allocation failure, process files without queue
+for (i = 1; i < argc; i++) 
+{    
+    map_fn(argv[i]);
+    return;
+}
+//continue if allocation success
+queue.count = (size_t)files_count;
+queue.next = 0;
+
+for (i = 0; i < files_count; i++) 
+{
+    struct stat file_info;
+    queue.files[i].name = argv[i + 1];
+    if (stat(argv[i + 1], &file_info) == 0) queue.files[i].size = file_info.st_size; // update queue size for valid threads
+    else queue.files[i].size = 0; //undo
+}
+
+qsort(queue.files, queue.count, sizeof(*queue.files), compare_map_files);
+
+if (pthread_mutex_init(&queue.lock, NULL) != 0) 
+{
+    for (i = 0; i < files_count; i++) map_fn(queue.files[i].name);
+    free(queue.files);
+    return;
+}
+
+if (num_mappers < 1) num_mappers = 1; // count check
+
+threads = malloc((size_t)num_mappers * sizeof(*threads));
+if (threads == NULL) 
+{
+    // if calling thread drains queue
+    mapper_worker(&queue);
+    pthread_mutex_destroy(&queue.lock);
+    free(queue.files);
+    return;
+}
+
+for (i = 0; i < num_mappers; i++) 
+{
+    if (pthread_create(&threads[threads_created], NULL, mapper_worker, &queue) != 0) 
+    {
+        //if thread creation fails, stop creating threads 
+        break;
+    }
+        threads_created++;
+    }
+
+//caller drains remaining work if creation incomplete
+if (threads_created < num_mappers) mapper_worker(&queue);
+
+for (i = 0; i < threads_created; i++) pthread_join(threads[i], NULL);
+
+free(threads);
+pthread_mutex_destroy(&queue.lock);
+free(queue.files);
+}
