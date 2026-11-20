@@ -39,6 +39,7 @@ static void sort_partition(partition_t *p);                  /* Member 3 */
 static char *get_next(char *key, int partition_number);      /* Member 3 */
 static void reduce_phase(int num_reducers);                  /* Member 4 */
 static void store_destroy(void);                             /* Member 4 */
+unsigned int h31_hash(const char* s, size_t len);
 
 /* ===================== MEMBER 1: store + MR_Emit ===================== */
 
@@ -70,7 +71,7 @@ void MR_Emit(char *key, char *value) {
 
     // Determine destination partition
     unsigned long partition_index =
-        partition_function(key, num_partitions);
+        partition_fn(key, num_partitions);
 
     if (partition_index >= (unsigned long)num_partitions) {
         return;
@@ -78,7 +79,7 @@ void MR_Emit(char *key, char *value) {
 
     partition_t *partition = &partitions[partition_index];
 
-    int bucket_index = h31_hash(key, sizeof(key)/sizeof(char));
+    int bucket_index = h31_hash(key, strlen(key));
 
     // Allocate the value node and independent value copy
     value_node_t *new_value = malloc(sizeof(value_node_t));
@@ -87,7 +88,7 @@ void MR_Emit(char *key, char *value) {
         return;
     }
 
-    strcpy(new_value->value, value);
+    new_value->value = strdup(value);
 
     if (new_value->value == NULL) {
         free(new_value);
@@ -137,7 +138,7 @@ void MR_Emit(char *key, char *value) {
         return;
     }
 
-    strcpy(new_key->key, key);
+    new_key->key = strdup(key);
 
     if (new_key->key == NULL) {
         pthread_mutex_unlock(&partition->lock);
