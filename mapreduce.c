@@ -58,8 +58,106 @@ static void store_init(int n) {
 }
 
 void MR_Emit(char *key, char *value) {
-    /* TODO(M1) */
-    (void)key; (void)value;
+    if (key == NULL || value == NULL) {
+        return;
+    }
+
+    if (partitions == NULL ||
+        num_partitions <= 0 ||
+        partition_fn == NULL) {
+        return;
+    }
+
+    // Determine destination partition
+    unsigned long partition_index =
+        partition_function(key, num_partitions);
+
+    if (partition_index >= (unsigned long)num_partitions) {
+        return;
+    }
+
+    partition_t *partition = &partitions[partition_index];
+
+    int bucket_index = h31_hash(key, sizeof(key)/sizeof(char));
+
+    // Allocate the value node and independent value copy
+    value_node_t *new_value = malloc(sizeof(value_node_t));
+
+    if (new_value == NULL) {
+        return;
+    }
+
+    strcpy(new_value->value, value);
+
+    if (new_value->value == NULL) {
+        free(new_value);
+        return;
+    }
+
+    new_value->next = NULL;
+
+    // Lock the partition before modifying shared storage
+    int lock_result = pthread_mutex_lock(&partition->lock);
+
+    if (lock_result != 0) {
+        free(new_value->value);
+        free(new_value);
+        return;
+    }
+
+    // Check if the key exists
+    key_entry_t *current = partition->buckets[bucket_index];
+
+    while (current != NULL) {
+        if (strcmp(current->key, key) == 0) {
+            // If there is a duplicate key then append the new value at the end of the list
+            value_node_t *tmp = current->head;
+            while (tmp != NULL) { // Find end of list
+                tmp = tmp->next;
+            }
+            tmp->next = new_value;
+
+            pthread_mutex_unlock(&partition->lock);
+
+            return;
+        }
+
+        current = current->next;
+    }
+
+    // If the key does not exist then create a new entry
+    key_entry_t *new_key = malloc(sizeof(key_entry_t));
+
+    if (new_key == NULL) {
+        pthread_mutex_unlock(&partition->lock);
+
+        free(new_value->value);
+        free(new_value);
+
+        return;
+    }
+
+    strcpy(new_key->key, key);
+
+    if (new_key->key == NULL) {
+        pthread_mutex_unlock(&partition->lock);
+
+        free(new_key);
+        free(new_value->value);
+        free(new_value);
+
+        return;
+    }
+
+    new_key->head = new_value;
+
+    // Insert at the beginning of the bucket's linked list
+    new_key->next = partition->buckets[bucket_index];
+
+    partition->buckets[bucket_index] = new_key;
+
+    // Release the mutex 
+    pthread_mutex_unlock(&partition->lock);
 }
 
 unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
