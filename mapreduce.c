@@ -333,26 +333,105 @@ static char *get_next(char *key, int partition_number)
 
 /* ===================== MEMBER 4: reduce phase + lifecycle ===================== */
 
-static void reduce_phase(int num_reducers) {
-    /* TODO(M4): remove these two lines once reducer threads use them */
-    (void)sort_partition; (void)get_next;
-    (void)num_reducers;
+/*  Diego Mendoza
+    Member 4: reducer_worker, reduce_phase, store_destroy, and MR_Run
+*/
+
+typedef struct ReducerTask {
+    int partition_number;
+    pthread_t thread;
+    int started;
+} ReducerTask;
+
+static void *reducer_worker(void *arg)
+{
+    const ReducerTask *task = arg;
+    int partition_number = task->partition_number;
+    partition_t *partition = &partitions[partition_number];
+
+    // sort this partition once and set each key's cursor before reducing
+    sort_partition(partition);
+    for (partition->current = 0; partition->current < partition->num_keys;
+         ++partition->current) {
+        // current lets get_next find the key we're reducing, e.g. apple before banana
+        key_entry_t *key = partition->sorted[partition->current];
+        reduce_fn(key->key, get_next, partition_number);
+    }
+    return NULL;
 }
 
-static void store_destroy(void) {
-    /* TODO(M4) */
+static void reduce_phase(int num_reducers)
+{
+    // give each worker its own partition number and keep the tasks until all joins finish
+    ReducerTask *tasks = calloc((size_t)num_reducers, sizeof(*tasks));
+    // run the reducers on this thread if we can't allocate the task array
+    if (tasks == NULL) {
+        for (int i = 0; i < num_reducers; ++i) {
+            ReducerTask task = { .partition_number = i };
+            reducer_worker(&task);
+        }
+        return;
+    }
+
+    for (int i = 0; i < num_reducers; ++i) {
+        tasks[i].partition_number = i;
+        tasks[i].started = pthread_create(&tasks[i].thread, NULL,
+                                          reducer_worker, &tasks[i]) == 0;
+        // process this partition here if its thread couldn't start
+        if (!tasks[i].started)
+            reducer_worker(&tasks[i]);
+    }
+    for (int i = 0; i < num_reducers; ++i) {
+        // wait for each worker so cleanup can safely free the keys and values
+        if (tasks[i].started && pthread_join(tasks[i].thread, NULL) != 0)
+            abort();
+    }
+    free(tasks);
 }
 
-void MR_Run(int argc, char *argv[],
-            Mapper map, int num_mappers,
-            Reducer reduce, int num_reducers,
-            Partitioner partition) {
-    /* TODO(M4): this is the intended order; fill in details */
+static void store_destroy(void)
+{
+    for (int i = 0; i < num_partitions; ++i) {
+        partition_t *partition = &partitions[i];
+        // sorted holds pointers to the keys, and the buckets own the key nodes
+        free(partition->sorted);
+        for (size_t bucket = 0; bucket < (size_t)partition->num_buckets; ++bucket) {
+            key_entry_t *key = partition->buckets[bucket];
+            while (key != NULL) {
+                key_entry_t *next_key = key->next;
+                // start at head so we free every value, including ones the reducer didn't read
+                value_node_t *value = key->head;
+                while (value != NULL) {
+                    value_node_t *next_value = value->next;
+                    free(value->value);
+                    free(value);
+                    value = next_value;
+                }
+                free(key->key);
+                free(key);
+                key = next_key;
+            }
+        }
+        free(partition->buckets);
+        pthread_mutex_destroy(&partition->lock);
+    }
+    free(partitions);
+    partitions = NULL;
+    num_partitions = 0;
+}
+
+void MR_Run(int argc, char *argv[], Mapper map, int num_mappers,
+            Reducer reduce, int num_reducers, Partitioner partition)
+{
+    if (num_reducers <= 0)
+        return;
+
     map_fn = map;
     reduce_fn = reduce;
-    partition_fn = partition;
+    partition_fn = partition != NULL ? partition : MR_DefaultHashPartition;
     num_partitions = num_reducers;
 
+    // initialize storage, finish mapping, reduce in key order per partition, then clean up
     store_init(num_partitions);
     map_phase(argc, argv, num_mappers);
     reduce_phase(num_reducers);
