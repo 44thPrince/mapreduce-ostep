@@ -50,7 +50,7 @@ static void store_init(int n) {
         partitions[i] = (partition_t) {
             .lock = PTHREAD_MUTEX_INITIALIZER,
             .num_buckets = num_buckets,
-            .buckets = calloc(partitions[i].num_buckets,sizeof(key_entry_t)),
+            .buckets = calloc(partitions[i].num_buckets,sizeof(key_entry_t*)),
             .num_keys = 0,
             .sorted = NULL,
             .current = 0
