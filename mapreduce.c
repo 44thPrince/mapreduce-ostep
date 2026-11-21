@@ -16,6 +16,7 @@ typedef struct value_node {
 typedef struct key_entry {
     char *key;                  /* library's own copy of the key */
     value_node_t *head;         /* all values emitted for this key */
+    value_node_t *tail;         /* last value, for constant-time append */
     value_node_t *cursor;       /* next value get_next() will return */
     struct key_entry *next;     /* next entry in the same hash bucket */
 } key_entry_t;
@@ -106,10 +107,8 @@ void MR_Emit(char *key, char *value) {
 
     for (entry = p->buckets[bucket]; entry != NULL; entry = entry->next) {
         if (strcmp(entry->key, key) == 0) {
-            value_node_t *last = entry->head;
-            while (last->next != NULL)
-                last = last->next;
-            last->next = new_value;
+            entry->tail->next = new_value;
+            entry->tail = new_value;
             pthread_mutex_unlock(&p->lock);
             return;
         }
@@ -132,6 +131,7 @@ void MR_Emit(char *key, char *value) {
     }
     strcpy(entry->key, key);
     entry->head = new_value;
+    entry->tail = new_value;
     entry->cursor = NULL;
     entry->next = p->buckets[bucket];
     p->buckets[bucket] = entry;
@@ -145,7 +145,7 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
 
     if (key == NULL || num_partitions <= 0)
         return 0;
-    while ((c = (unsigned char)*key++) != '\0')
+    while ((c = *key++) != '\0')
         hash = hash * 33 + (unsigned long)c;
     return hash % (unsigned long)num_partitions;
 }
