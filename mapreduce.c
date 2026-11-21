@@ -1,3 +1,65 @@
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "mapreduce.h"
+
+/* ===================== SHARED: do not edit without team OK ===================== */
+
+typedef struct value_node {
+    char *value;                /* library's own copy of the emitted value */
+    struct value_node *next;
+} value_node_t;
+
+typedef struct key_entry {
+    char *key;                  /* library's own copy of the key */
+    value_node_t *head;         /* all values emitted for this key */
+    value_node_t *cursor;       /* next value get_next() will return */
+    struct key_entry *next;     /* next entry in the same hash bucket */
+} key_entry_t;
+
+typedef struct partition {
+    pthread_mutex_t lock;       /* held by MR_Emit while touching this partition */
+    key_entry_t **buckets;      /* hash table used during the map phase */
+    size_t num_buckets;
+    size_t num_keys;            /* unique keys in this partition */
+    key_entry_t **sorted;       /* built by sort_partition(), ascending by key */
+    size_t current;             /* index in sorted[] of the key being reduced */
+} partition_t;
+
+static partition_t *partitions;     /* array of num_partitions */
+static int num_partitions;          /* always equal to num_reducers */
+static Partitioner partition_fn;
+static Mapper map_fn;
+static Reducer reduce_fn;
+
+static void store_init(int n);                               /* Member 1 */
+static void map_phase(int argc, char *argv[], int num_mappers); /* Member 2 */
+static void sort_partition(partition_t *p);                  /* Member 3 */
+static char *get_next(char *key, int partition_number);      /* Member 3 */
+static void reduce_phase(int num_reducers);                  /* Member 4 */
+static void store_destroy(void);                             /* Member 4 */
+
+/* ===================== MEMBER 1: store + MR_Emit ===================== */
+
+static void store_init(int n) {
+    partitions = malloc(sizeof(partition_t) * n);
+    int num_buckets = 100; // Change if needed
+    for (int i = 0; i < n; i++) {
+        partitions[i] = (partition_t) {
+            .lock = PTHREAD_MUTEX_INITIALIZER,
+            .num_buckets = num_buckets,
+            .buckets = calloc(partitions[i].num_buckets,sizeof(key_entry_t)),
+            .num_keys = 0,
+            .sorted = NULL,
+            .current = 0
+        };
+    }
+}
+
+void MR_Emit(char *key, char *value) {
+    if (key == NULL || value == NULL) {
+        return;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -180,9 +242,7 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
     return hash % num_partitions;
 }
 
-
-
-
+/* ===================== MEMBER 2: map phase ===================== */
 
 // map threads and scheduling
 typedef struct map_file { // map file struct
@@ -301,3 +361,188 @@ static void map_phase(int argc, char *argv[], int num_mappers) // use mapping fu
     pthread_mutex_destroy(&queue.lock);
     free(queue.files);
 }
+
+/* ===================== MEMBER 3: sorting + getter ===================== */
+
+/*  Kevin Bernichio
+    Member 3: compareKeys, sort_partition, and get_next
+*/
+
+// comparator used by both qsort and bsearch to put keys in ascending order
+static int compareKeys(const void *a, const void *b)
+{
+    /*  - the sorted array holds key_entry_t pointers, so qsort and bsearch hand us
+        a pointer to one of those pointers
+        - strcmp compares byte by byte, so "" comes first and uppercase comes before lowercase
+    */
+
+    // dereference once to get the actual key entries we want to compare
+    const key_entry_t *left = *(key_entry_t *const *)a;
+    const key_entry_t *right = *(key_entry_t *const *)b;
+
+    return strcmp(left->key, right->key);
+}
+
+// copies every key in a partition into an array and sorts it in ascending order
+static void sort_partition(partition_t *p)
+{
+    /*  - called once per partition by that partition's reducer thread, after all of the mappers are done
+        - only that one thread touches this partition from here on, so we don't need a lock
+        - also points each key's cursor at its first value so get_next starts from the beginning
+    */
+
+    // declare and initialize our variables that we'll need later
+    size_t keyCount = 0;
+    size_t index = 0;
+    key_entry_t *entry;
+
+    // reset the index of the key being reduced
+    p->current = 0;
+
+    // count the keys by walking every bucket instead of trusting num_keys, so the array size always matches what's actually stored
+    for(size_t bucket = 0; bucket < p->num_buckets; bucket++)
+    {
+        for(entry = p->buckets[bucket]; entry != NULL; entry = entry->next)
+        {
+            keyCount++;
+        }
+    }
+
+    p->num_keys = keyCount;
+
+    // an empty partition has nothing to sort, so sorted stays NULL
+    if(keyCount == 0)
+    {
+        return;
+    }
+
+    // allocate room for one pointer per key
+    p->sorted = malloc(keyCount * sizeof(key_entry_t *));
+
+    // if malloc fails, set num_keys to 0 so the reducer loop just doesn't run
+    if(p->sorted == NULL)
+    {
+        p->num_keys = 0;
+        return;
+    }
+
+    // walk the buckets again, this time copying each key entry into the array
+    for(size_t bucket = 0; bucket < p->num_buckets; bucket++)
+    {
+        for(entry = p->buckets[bucket]; entry != NULL; entry = entry->next)
+        {
+            // point the cursor at the first value so get_next starts at the beginning of the list
+            entry->cursor = entry->head;
+
+            p->sorted[index] = entry;
+            index++;
+        }
+    }
+
+    // sort the array of key entries in ascending order using our comparator
+    qsort(p->sorted, p->num_keys, sizeof(key_entry_t *), compareKeys);
+}
+
+// the Getter passed to the user's Reduce(), returns the next value for a key
+static char *get_next(char *key, int partition_number)
+{
+    /*  - returns the next value for the key, or NULL once every value has been returned
+        - keeps returning NULL on every call after that, it doesn't wrap back around
+        - each key's cursor remembers where it left off, so reducers working on
+        different partitions can't mess with each other's iteration
+    */
+
+    // declare and/or initialize our variables that we'll need later
+    partition_t *p;
+    key_entry_t *entry = NULL;
+    char *value;
+
+    // reject a NULL key or a partition number that's out of range
+    if(key == NULL || partition_number < 0 || partition_number >= num_partitions)
+    {
+        return NULL;
+    }
+
+    p = &partitions[partition_number];
+
+    // an empty partition never got a sorted array, so there's nothing to return
+    if(p->sorted == NULL)
+    {
+        return NULL;
+    }
+
+    /*  - fast path: check the key currently being reduced first, since that's almost always the one being asked for
+        - comparing the pointers first is cheap because the reducer passes in the library's own key string
+    */
+    if(p->current < p->num_keys)
+    {
+        key_entry_t *currentEntry = p->sorted[p->current];
+
+        if(currentEntry->key == key || strcmp(currentEntry->key, key) == 0)
+        {
+            entry = currentEntry;
+        }
+    }
+
+    // slow path: it's some other key, so binary search the sorted array for it
+    if(entry == NULL)
+    {
+        // bsearch needs the item we're searching for to look like an array element, which is a pointer to a key_entry_t
+        key_entry_t probe;
+        key_entry_t *probePtr = &probe;
+        key_entry_t **found;
+
+        probe.key = key;
+        found = bsearch(&probePtr, p->sorted, p->num_keys, sizeof(key_entry_t *), compareKeys);
+
+        // the key isn't in this partition
+        if(found == NULL)
+        {
+            return NULL;
+        }
+
+        entry = *found;
+    }
+
+    // every value for this key has already been returned
+    if(entry->cursor == NULL)
+    {
+        return NULL;
+    }
+
+    // save the current value, then move the cursor to the next node for the next call
+    value = entry->cursor->value;
+    entry->cursor = entry->cursor->next;
+
+    // return the library's stored pointer, Member 4's cleanup frees it after reducing is done
+    return value;
+}
+
+/* ===================== MEMBER 4: reduce phase + lifecycle ===================== */
+
+static void reduce_phase(int num_reducers) {
+    /* TODO(M4): remove these two lines once reducer threads use them */
+    (void)sort_partition; (void)get_next;
+    (void)num_reducers;
+}
+
+static void store_destroy(void) {
+    /* TODO(M4) */
+}
+
+void MR_Run(int argc, char *argv[],
+            Mapper map, int num_mappers,
+            Reducer reduce, int num_reducers,
+            Partitioner partition) {
+    /* TODO(M4): this is the intended order; fill in details */
+    map_fn = map;
+    reduce_fn = reduce;
+    partition_fn = partition;
+    num_partitions = num_reducers;
+
+    store_init(num_partitions);
+    map_phase(argc, argv, num_mappers);
+    reduce_phase(num_reducers);
+    store_destroy();
+}
+
